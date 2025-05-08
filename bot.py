@@ -2,31 +2,42 @@ import logging
 import sqlite3
 import datetime
 import os
+import asyncio
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 import aiocron
-import asyncio
 import re
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
-# Bot token and admin IDs from environment variables
+# Validate environment variables
 API_TOKEN = os.getenv('BOT_TOKEN')
-ADMIN_IDS = [int(admin_id) for admin_id in os.getenv('ADMIN_IDS', '').split(',') if admin_id]
+if not API_TOKEN:
+    logging.error("BOT_TOKEN environment variable is not set or empty")
+    raise ValueError("BOT_TOKEN environment variable is not set or empty")
 
-# Ensure the data directory exists (will be mounted as a Railway volume at /app/data)
-data_dir = '/app/data'  # Absolute path for clarity, matches Railway volume mount
-os.makedirs(data_dir, exist_ok=True)  # Create directory if it doesn't exist
+ADMIN_IDS = []
+try:
+    admin_ids_str = os.getenv('ADMIN_IDS', '')
+    if admin_ids_str:
+        ADMIN_IDS = [int(admin_id) for admin_id in admin_ids_str.split(',') if admin_id]
+except ValueError as e:
+    logging.error(f"Invalid ADMIN_IDS format: {e}")
+    raise ValueError(f"Invalid ADMIN_IDS format: {admin_ids_str}")
+
+# Ensure data directory exists (Railway volume at /app/data)
+data_dir = '/app/data'
+os.makedirs(data_dir, exist_ok=True)
 
 # Initialize SQLite database
 db_path = os.path.join(data_dir, 'telegram_bot.db')
-conn = sqlite3.connect(db_path, check_same_thread=False)  # Allow multi-threaded access
+conn = sqlite3.connect(db_path, check_same_thread=False)
 cursor = conn.cursor()
 
 # Create database tables
@@ -59,7 +70,7 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
 ''')
 conn.commit()
 
-# Configure logging to write to a file in the data directory and console
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -71,11 +82,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Initialize bot and dispatcher
-bot = Bot(token=API_TOKEN)
+try:
+    bot = Bot(token=API_TOKEN)
+except Exception as e:
+    logging.error(f"Failed to initialize bot: {e}")
+    raise
+
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
-# Define FSM states for message scheduling
+# Define FSM states
 class NewMessage(StatesGroup):
     target_type = State()
     target_id = State()
@@ -85,7 +101,7 @@ class NewMessage(StatesGroup):
     specific_time = State()
     specific_days = State()
 
-# Keyboard functions (unchanged)
+# Keyboard functions
 def get_main_keyboard(is_admin=False):
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     keyboard.row(KeyboardButton("📤 Xabar yuborish"))
@@ -146,7 +162,7 @@ def get_admin_keyboard():
     keyboard.row(KeyboardButton("🔙 Orqaga"))
     return keyboard
 
-# Register user in the database
+# Register user
 async def register_user(message: types.Message):
     user_id = message.from_user.id
     username = message.from_user.username
@@ -163,44 +179,66 @@ async def register_user(message: types.Message):
         (now, user_id)
     )
     conn.commit()
+    logging.info(f"User registered/updated: {user_id}")
 
 # Send message to target
 async def send_message_to_target(target_type, target_id, message_text):
+    logging.info(f"Attempting to send message to {target_type} ({target_id}): {message_text[:50]}...")
     try:
-        if target_type == "user":
-            await bot.send_message(chat_id=target_id, text=message_text)
-        elif target_type == "group":
-            await bot.send_message(chat_id=target_id, text=message_text)
-        elif target_type == "channel":
-            await bot.send_message(chat_id=target_id, text=message_text)
+        # Validate target_id
+        if target_type == "user" and target_id.startswith('@'):
+            # Resolve username to chat ID
+            try:
+                chat = await bot.get_chat(target_id)
+                target_id = chat.id
+            except Exception as e:
+                logging.error(f"Failed to resolve username {target_id}: {e}")
+                return False
+        # Send message
+        await bot.send_message(chat_id=target_id, text=message_text)
+        logging.info(f"Message sent successfully to {target_type} ({target_id})")
         return True
     except Exception as e:
-        logging.error(f"Error sending message: {e}")
+        logging.error(f"Error sending message to {target_type} ({target_id}): {e}")
         return False
 
 # Check and send scheduled messages
 async def check_scheduled_messages():
+    logging.info("Checking scheduled messages...")
     now = datetime.now()
     cursor.execute("SELECT * FROM scheduled_messages WHERE is_active = 1")
     scheduled = cursor.fetchall()
+    logging.info(f"Found {len(scheduled)} active scheduled messages")
     for msg in scheduled:
         msg_id, target_type, target_id, message_text, interval_minutes, specific_time, specific_days, last_sent, is_active, created_by = msg
         should_send = False
+        logging.debug(f"Evaluating message ID {msg_id}: {target_type} ({target_id}), interval={interval_minutes}, time={specific_time}, days={specific_days}")
+        # Interval-based
         if interval_minutes:
-            if last_sent is None or now - datetime.fromisoformat(last_sent) > timedelta(minutes=interval_minutes):
+            last_sent_dt = datetime.fromisoformat(last_sent) if last_sent else None
+            if last_sent_dt is None or now - last_sent_dt >= timedelta(minutes=interval_minutes):
                 should_send = True
+                logging.info(f"Message {msg_id} due for interval (every {interval_minutes} minutes)")
+        # Specific time
         if specific_time:
             current_time = now.strftime("%H:%M")
-            if current_time == specific_time and (last_sent is None or datetime.fromisoformat(last_sent).date() < now.date()):
+            last_sent_dt = datetime.fromisoformat(last_sent) if last_sent else None
+            if current_time == specific_time and (last_sent_dt is None or last_sent_dt.date() < now.date()):
                 should_send = True
+                logging.info(f"Message {msg_id} due for specific time ({specific_time})")
+        # Specific days
         if specific_days:
             days = specific_days.split(',')
             current_day = now.strftime("%A").lower()
             current_time = now.strftime("%H:%M")
+            last_sent_dt = datetime.fromisoformat(last_sent) if last_sent else None
             if current_day in days and current_time == "09:00":
-                if last_sent is None or datetime.fromisoformat(last_sent).date() < now.date():
+                if last_sent_dt is None or last_sent_dt.date() < now.date():
                     should_send = True
+                    logging.info(f"Message {msg_id} due for specific days ({specific_days}) at 09:00")
+        # Send message if due
         if should_send:
+            logging.info(f"Sending message {msg_id} to {target_type} ({target_id})")
             success = await send_message_to_target(target_type, target_id, message_text)
             if success:
                 cursor.execute(
@@ -208,13 +246,11 @@ async def check_scheduled_messages():
                     (now.isoformat(), msg_id)
                 )
                 conn.commit()
+                logging.info(f"Message {msg_id} sent and last_sent updated")
+            else:
+                logging.error(f"Failed to send message {msg_id}")
 
-# Schedule cron task for checking messages
-@aiocron.crontab('* * * * *')
-async def scheduled_check():
-    await check_scheduled_messages()
-
-# Command handlers (unchanged)
+# Command handlers
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
     await register_user(message)
@@ -573,7 +609,7 @@ async def process_day_selection(callback_query: types.CallbackQuery, state: FSMC
         selected_days.append(day)
     await state.update_data(selected_days=selected_days)
     days_names = {
-        "monday": "Dushanba", "tuesday": "Seshanba", "wednesday": "Chorshanba",
+        "ਲੀ": "Dushanba", "tuesday": "Seshanba", "wednesday": "Chorshanba",
         "thursday": "Payshanba", "friday": "Juma", "saturday": "Shanba", "sunday": "Yakshanba"
     }
     days_text = ", ".join([days_names.get(d, d) for d in selected_days])
@@ -664,7 +700,14 @@ async def process_regular_messages(message: types.Message):
         reply_markup=keyboard
     )
 
+# Start cron tasks explicitly
+async def start_cron_tasks():
+    cron = aiocron.crontab('* * * * *', func=check_scheduled_messages, start=True)
+    logging.info("Cron task started")
+    await cron.__anext__()  # Ensure the cron task is awaited
+
 if __name__ == '__main__':
+    logging.info("Starting bot...")
     loop = asyncio.get_event_loop()
-    aiocron.crontab('* * * * *', func=scheduled_check, start=True, loop=loop)
-    executor.start_polling(dp, skip_updates=True)
+    loop.create_task(start_cron_tasks())
+    executor.start_polling(dp, skip_updates=True, loop=loop)
