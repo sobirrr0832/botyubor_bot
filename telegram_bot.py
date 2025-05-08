@@ -1,6 +1,7 @@
 import logging
 import sqlite3
 import datetime
+import os
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
@@ -10,274 +11,25 @@ import aiocron
 import asyncio
 import re
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+# .env faylidan ma'lumotlarni yuklash
+load_dotenv()
 
 # Bot tokeni
-API_TOKEN = 'time_str = message.text
-time_pattern = re.compile(r'^([01]?[0-9]|2[0-3]):([0-5][0-9])$')
-    
-if not time_pattern.match(time_str):
-    await message.answer(
-        "Noto'g'ri vaqt formati. HH:MM formatida kiriting.\n"
-        "Masalan: 09:00 yoki 18:30",
-        reply_markup=get_cancel_keyboard()
-    )
-    return
-    
-await state.update_data(specific_time=time_str)
-    
-# Ma'lumotlarni olish
-data = await state.get_data()
-target_type = data.get('target_type')
-target_id = data.get('target_id')
-message_text = data.get('message_text')
-    
-# Bazaga saqlash
-now = datetime.now()
-cursor.execute(
-    "INSERT INTO scheduled_messages (target_type, target_id, message_text, specific_time, created_by, is_active) "
-    "VALUES (?, ?, ?, ?, ?, ?)",
-    (target_type, target_id, message_text, time_str, message.from_user.id, True)
-)
-conn.commit()
-    
-await message.answer(
-    f"✅ Xabar rejalashtirildi!\n\n"
-    f"Har kuni {time_str} da yuboriladi.",
-    reply_markup=get_main_keyboard(message.from_user.id in ADMIN_IDS)
-)
-    
-await state.finish()
+API_TOKEN = os.getenv('BOT_TOKEN')
 
-# Hafta kunlari bo'yicha yuborish
-@dp.callback_query_handler(lambda c: c.data.startswith('day_'), state=NewMessage.specific_days)
-async def process_day_selection(callback_query: types.CallbackQuery, state: FSMContext):
-    await callback_query.answer()
-    
-    day = callback_query.data.split('_')[1]
-    data = await state.get_data()
-    selected_days = data.get('selected_days', [])
-    
-    if day in selected_days:
-        selected_days.remove(day)
-    else:
-        selected_days.append(day)
-    
-    await state.update_data(selected_days=selected_days)
-    
-    days_names = {
-        "monday": "Dushanba", 
-        "tuesday": "Seshanba", 
-        "wednesday": "Chorshanba",
-        "thursday": "Payshanba", 
-        "friday": "Juma", 
-        "saturday": "Shanba", 
-        "sunday": "Yakshanba"
-    }
-    
-    selected_names = [days_names[d] for d in selected_days]
-    
-    await callback_query.message.edit_text(
-        f"Tanlangan kunlar: {', '.join(selected_names) if selected_names else 'Tanlanmagan'}\n\n"
-        f"Tanlashni davom ettiring yoki \"Tayyor\" tugmasini bosing.",
-        reply_markup=get_days_keyboard()
-    )
+# Admin IDlarini yuklash
+ADMIN_IDS = [int(admin_id) for admin_id in os.getenv('ADMIN_IDS', '').split(',') if admin_id]
 
-@dp.callback_query_handler(lambda c: c.data == "days_done", state=NewMessage.specific_days)
-async def process_days_done(callback_query: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    selected_days = data.get('selected_days', [])
-    
-    if not selected_days:
-        await callback_query.answer("Kamida bitta kunni tanlang!")
-        return
-    
-    await callback_query.answer("Kunlar saqlandi!")
-    
-    # Ma'lumotlarni olish
-    target_type = data.get('target_type')
-    target_id = data.get('target_id')
-    message_text = data.get('message_text')
-    days_str = ','.join(selected_days)
-    
-    # Bazaga saqlash
-    now = datetime.now()
-    cursor.execute(
-        "INSERT INTO scheduled_messages (target_type, target_id, message_text, specific_days, created_by, is_active) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (target_type, target_id, message_text, days_str, callback_query.from_user.id, True)
-    )
-    conn.commit()
-    
-    days_names = {
-        "monday": "Dushanba", 
-        "tuesday": "Seshanba", 
-        "wednesday": "Chorshanba",
-        "thursday": "Payshanba", 
-        "friday": "Juma", 
-        "saturday": "Shanba", 
-        "sunday": "Yakshanba"
-    }
-    
-    selected_names = [days_names[d] for d in selected_days]
-    
-    await callback_query.message.edit_text(
-        f"✅ Xabar rejalashtirildi!\n\n"
-        f"Har hafta {', '.join(selected_names)} kunlari soat 09:00 da yuboriladi."
-    )
-    
-    is_admin = callback_query.from_user.id in ADMIN_IDS
-    await callback_query.message.answer("Asosiy menyu:", reply_markup=get_main_keyboard(is_admin))
-    
-    await state.finish()
-
-# Rejalarni bekor qilish
-@dp.message_handler(lambda message: message.text == "🚫 Rejalarni bekor qilish")
-async def cancel_scheduled_messages(message: types.Message):
-    user_id = message.from_user.id
-    
-    # Foydalanuvchining rejalashtirilgan xabarlarini olish
-    cursor.execute(
-        "SELECT * FROM scheduled_messages WHERE created_by = ? AND is_active = 1",
-        (user_id,)
-    )
-    messages = cursor.fetchall()
-    
-    if not messages:
-        await message.answer("❌ Sizning rejalashtirilgan xabarlaringiz yo'q")
-        return
-    
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    
-    for msg in messages:
-        msg_id, target_type, target_id, message_text, interval_minutes, specific_time, specific_days, last_sent, is_active, created_by = msg
-        
-        schedule_info = ""
-        if interval_minutes:
-            schedule_info = f"Har {interval_minutes} daqiqada"
-        elif specific_time:
-            schedule_info = f"Har kuni {specific_time} da"
-        elif specific_days:
-            days_list = specific_days.split(',')
-            days_names = {
-                "monday": "Dushanba", 
-                "tuesday": "Seshanba", 
-                "wednesday": "Chorshanba",
-                "thursday": "Payshanba", 
-                "friday": "Juma", 
-                "saturday": "Shanba", 
-                "sunday": "Yakshanba"
-            }
-            days_readable = [days_names.get(day, day) for day in days_list]
-            schedule_info = f"{', '.join(days_readable)} kunlari"
-        
-        target_info = f"@{target_id}" if target_id.startswith('@') else target_id
-        
-        button_text = f"❌ #{msg_id}: {target_info} ({schedule_info})"
-        keyboard.add(InlineKeyboardButton(
-            text=button_text,
-            callback_data=f"cancel_msg_{msg_id}"
-        ))
-    
-    await message.answer(
-        "🚫 Bekor qilmoqchi bo'lgan xabarni tanlang:",
-        reply_markup=keyboard
-    )
-
-@dp.callback_query_handler(lambda c: c.data.startswith('cancel_msg_'))
-async def process_cancel_message(callback_query: types.CallbackQuery):
-    msg_id = int(callback_query.data.split('_')[2])
-    
-    cursor.execute(
-        "UPDATE scheduled_messages SET is_active = 0 WHERE id = ? AND created_by = ?",
-        (msg_id, callback_query.from_user.id)
-    )
-    conn.commit()
-    
-    await callback_query.answer(f"#{msg_id} bekor qilindi!")
-    
-    # Qolgan xabarlarni tekshirish
-    cursor.execute(
-        "SELECT COUNT(*) FROM scheduled_messages WHERE created_by = ? AND is_active = 1",
-        (callback_query.from_user.id,)
-    )
-    count = cursor.fetchone()[0]
-    
-    if count > 0:
-        # Buttonlarni yangilash
-        cursor.execute(
-            "SELECT * FROM scheduled_messages WHERE created_by = ? AND is_active = 1",
-            (callback_query.from_user.id,)
-        )
-        messages = cursor.fetchall()
-        
-        keyboard = InlineKeyboardMarkup(row_width=1)
-        
-        for msg in messages:
-            msg_id, target_type, target_id, message_text, interval_minutes, specific_time, specific_days, last_sent, is_active, created_by = msg
-            
-            schedule_info = ""
-            if interval_minutes:
-                schedule_info = f"Har {interval_minutes} daqiqada"
-            elif specific_time:
-                schedule_info = f"Har kuni {specific_time} da"
-            elif specific_days:
-                days_list = specific_days.split(',')
-                days_names = {
-                    "monday": "Dushanba", 
-                    "tuesday": "Seshanba", 
-                    "wednesday": "Chorshanba",
-                    "thursday": "Payshanba", 
-                    "friday": "Juma", 
-                    "saturday": "Shanba", 
-                    "sunday": "Yakshanba"
-                }
-                days_readable = [days_names.get(day, day) for day in days_list]
-                schedule_info = f"{', '.join(days_readable)} kunlari"
-            
-            target_info = f"@{target_id}" if target_id.startswith('@') else target_id
-            
-            button_text = f"❌ #{msg_id}: {target_info} ({schedule_info})"
-            keyboard.add(InlineKeyboardButton(
-                text=button_text,
-                callback_data=f"cancel_msg_{msg_id}"
-            ))
-        
-        await callback_query.message.edit_text(
-            "🚫 Bekor qilmoqchi bo'lgan xabarni tanlang:",
-            reply_markup=keyboard
-        )
-    else:
-        is_admin = callback_query.from_user.id in ADMIN_IDS
-        await callback_query.message.edit_text("✅ Barcha rejalashtirilgan xabarlar bekor qilindi.")
-        await callback_query.message.answer("Asosiy menyu:", reply_markup=get_main_keyboard(is_admin))
-
-# Foydalanuvchi faolligini kuzatish
-@dp.message_handler()
-async def track_user_activity(message: types.Message):
-    await register_user(message)
-    
-    # Asosiy menyuga qaytish
-    if message.text == "/menu":
-        is_admin = message.from_user.id in ADMIN_IDS
-        await message.answer("Asosiy menyu:", reply_markup=get_main_keyboard(is_admin))
-    else:
-        # Boshqa buyruqlar uchun
-        await message.answer(
-            "🤔 Nima qilishni xohlaysiz?\n\n"
-            "Asosiy menyuga qaytish uchun /menu buyrug'ini yuboring.",
-            reply_markup=get_main_keyboard(message.from_user.id in ADMIN_IDS)
-        )
-
-if __name__ == '__main__':
-    # Scheduled taskni ishga tushirish
-    loop = asyncio.get_event_loop()
-    scheduled_check.start()
-    
-    # Botni ishga tushirish
-    executor.start_polling(dp, skip_updates=True)'
+# Data papkasini tekshirish va yaratish
+data_dir = 'data'
+if not os.path.exists(data_dir):
+    os.makedirs(data_dir)
 
 # Ma'lumotlar bazasini ishga tushirish
-conn = sqlite3.connect('telegram_bot.db')
+db_path = os.path.join(data_dir, 'telegram_bot.db')
+conn = sqlite3.connect(db_path)
 cursor = conn.cursor()
 
 # Jadvallarni yaratish
@@ -312,15 +64,21 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
 conn.commit()
 
 # Logging sozlash
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(data_dir, 'bot.log')),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
 
 # Bot va dispatcher yaratish
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
-
-# Admin IDlarini ro'yxatga olish
-ADMIN_IDS = [123456789]  # O'zingizning ID raqamingizni qo'ying
 
 # State klasslarini yaratish
 class NewMessage(StatesGroup):
@@ -815,32 +573,29 @@ async def process_schedule_type(message: types.Message, state: FSMContext):
         await state.update_data(schedule_type="interval")
         await NewMessage.interval.set()
         await message.answer(
-            "Necha daqiqada bir xabar yuborilsin?\n"
-            "Raqam kiriting (5 dan 1440 gacha).",
+            ""Necha daqiqada bir xabar yuborilsin?\n"
+            "Raqam kiriting (masalan: 30, 60, 120...)",
             reply_markup=get_cancel_keyboard()
         )
-    
     elif schedule_type == "🕒 Aniq vaqtda":
         await state.update_data(schedule_type="specific_time")
         await NewMessage.specific_time.set()
         await message.answer(
-            "Qaysi vaqtda xabar yuborilsin?\n"
-            "Format: HH:MM (24 soatlik format)\n"
-            "Masalan: 09:00 yoki 18:30",
+            "Har kuni qaysi vaqtda xabar yuborilsin?\n"
+            "Vaqtni HH:MM formatida kiriting (masalan: 09:00, 18:30)",
             reply_markup=get_cancel_keyboard()
         )
-    
     elif schedule_type == "📅 Hafta kunlarida":
         await state.update_data(schedule_type="specific_days")
         await state.update_data(selected_days=[])
         await NewMessage.specific_days.set()
         await message.answer(
-            "Qaysi kunlarda xabar yuborilsin?\n"
-            "Bir nechta kunlarni tanlashingiz mumkin.",
+            "Qaysi kunlari xabar yuborilsin?\n"
+            "Kunlarni tanlang:",
             reply_markup=get_days_keyboard()
         )
 
-# Interval bo'yicha yuborish
+# Interval ni olish
 @dp.message_handler(state=NewMessage.interval)
 async def process_interval(message: types.Message, state: FSMContext):
     if message.text == "❌ Bekor qilish":
@@ -851,45 +606,39 @@ async def process_interval(message: types.Message, state: FSMContext):
     
     try:
         interval = int(message.text)
-        if interval < 5 or interval > 1440:
-            await message.answer(
-                "Noto'g'ri vaqt. 5 daqiqadan 1440 daqiqagacha (24 soat) kiriting.",
-                reply_markup=get_cancel_keyboard()
-            )
-            return
-        
-        await state.update_data(interval=interval)
-        
-        # Ma'lumotlarni olish
-        data = await state.get_data()
-        target_type = data.get('target_type')
-        target_id = data.get('target_id')
-        message_text = data.get('message_text')
-        
-        # Bazaga saqlash
-        now = datetime.now()
-        cursor.execute(
-            "INSERT INTO scheduled_messages (target_type, target_id, message_text, interval_minutes, created_by, is_active) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (target_type, target_id, message_text, interval, message.from_user.id, True)
-        )
-        conn.commit()
-        
-        await message.answer(
-            f"✅ Xabar rejalashtirildi!\n\n"
-            f"Har {interval} daqiqada yuboriladi.",
-            reply_markup=get_main_keyboard(message.from_user.id in ADMIN_IDS)
-        )
-        
-        await state.finish()
-        
+        if interval < 1:
+            raise ValueError("Interval must be positive")
     except ValueError:
         await message.answer(
-            "Iltimos, faqat raqam kiriting.",
+            "Iltimos, musbat raqam kiriting.",
             reply_markup=get_cancel_keyboard()
         )
+        return
+    
+    await state.update_data(interval=interval)
+    
+    # Xabarni rejalashtirish
+    data = await state.get_data()
+    target_type = data.get('target_type')
+    target_id = data.get('target_id')
+    message_text = data.get('message_text')
+    
+    cursor.execute(
+        "INSERT INTO scheduled_messages (target_type, target_id, message_text, interval_minutes, created_by) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (target_type, target_id, message_text, interval, message.from_user.id)
+    )
+    conn.commit()
+    
+    await message.answer(
+        f"✅ Xabar rejalashtirildi!\n"
+        f"Har {interval} daqiqada yuboriladi.",
+        reply_markup=get_main_keyboard(message.from_user.id in ADMIN_IDS)
+    )
+    
+    await state.finish()
 
-# Aniq vaqt bo'yicha yuborish
+# Aniq vaqt olish
 @dp.message_handler(state=NewMessage.specific_time)
 async def process_specific_time(message: types.Message, state: FSMContext):
     if message.text == "❌ Bekor qilish":
@@ -897,43 +646,41 @@ async def process_specific_time(message: types.Message, state: FSMContext):
         is_admin = message.from_user.id in ADMIN_IDS
         await message.answer("Bekor qilindi.", reply_markup=get_main_keyboard(is_admin))
         return
-    time_str = message.text
-time_pattern = re.compile(r'^([01]?[0-9]|2[0-3]):([0-5][0-9])$')
     
-if not time_pattern.match(time_str):
-    await message.answer(
-        "Noto'g'ri vaqt formati. HH:MM formatida kiriting.\n"
-        "Masalan: 09:00 yoki 18:30",
-        reply_markup=get_cancel_keyboard()
+    # Vaqt formatini tekshirish (HH:MM)
+    if not re.match(r'^([01]\d|2[0-3]):([0-5]\d)$', message.text):
+        await message.answer(
+            "Noto'g'ri vaqt formati. Iltimos, HH:MM formatida kiriting.\n"
+            "Masalan: 09:00, 18:30",
+            reply_markup=get_cancel_keyboard()
+        )
+        return
+    
+    specific_time = message.text
+    await state.update_data(specific_time=specific_time)
+    
+    # Xabarni rejalashtirish
+    data = await state.get_data()
+    target_type = data.get('target_type')
+    target_id = data.get('target_id')
+    message_text = data.get('message_text')
+    
+    cursor.execute(
+        "INSERT INTO scheduled_messages (target_type, target_id, message_text, specific_time, created_by) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (target_type, target_id, message_text, specific_time, message.from_user.id)
     )
-    return
+    conn.commit()
     
-await state.update_data(specific_time=time_str)
+    await message.answer(
+        f"✅ Xabar rejalashtirildi!\n"
+        f"Har kuni {specific_time} da yuboriladi.",
+        reply_markup=get_main_keyboard(message.from_user.id in ADMIN_IDS)
+    )
     
-# Ma'lumotlarni olish
-data = await state.get_data()
-target_type = data.get('target_type')
-target_id = data.get('target_id')
-message_text = data.get('message_text')
-    
-# Bazaga saqlash
-now = datetime.now()
-cursor.execute(
-    "INSERT INTO scheduled_messages (target_type, target_id, message_text, specific_time, created_by, is_active) "
-    "VALUES (?, ?, ?, ?, ?, ?)",
-    (target_type, target_id, message_text, time_str, message.from_user.id, True)
-)
-conn.commit()
-    
-await message.answer(
-    f"✅ Xabar rejalashtirildi!\n\n"
-    f"Har kuni {time_str} da yuboriladi.",
-    reply_markup=get_main_keyboard(message.from_user.id in ADMIN_IDS)
-)
-    
-await state.finish()
+    await state.finish()
 
-# Hafta kunlari bo'yicha yuborish
+# Hafta kunlari tanlash
 @dp.callback_query_handler(lambda c: c.data.startswith('day_'), state=NewMessage.specific_days)
 async def process_day_selection(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
@@ -959,37 +706,43 @@ async def process_day_selection(callback_query: types.CallbackQuery, state: FSMC
         "sunday": "Yakshanba"
     }
     
-    selected_names = [days_names[d] for d in selected_days]
+    days_text = ", ".join([days_names.get(d, d) for d in selected_days])
     
-    await callback_query.message.edit_text(
-        f"Tanlangan kunlar: {', '.join(selected_names) if selected_names else 'Tanlanmagan'}\n\n"
-        f"Tanlashni davom ettiring yoki \"Tayyor\" tugmasini bosing.",
-        reply_markup=get_days_keyboard()
-    )
+    if selected_days:
+        await callback_query.message.edit_text(
+            f"Tanlangan kunlar: {days_text}\n\n"
+            f"Davom etish uchun \"✅ Tayyor\" tugmasini bosing.",
+            reply_markup=get_days_keyboard()
+        )
+    else:
+        await callback_query.message.edit_text(
+            f"Hech qanday kun tanlanmadi.\n"
+            f"Iltimos, kamida bitta kunni tanlang:",
+            reply_markup=get_days_keyboard()
+        )
 
-@dp.callback_query_handler(lambda c: c.data == "days_done", state=NewMessage.specific_days)
+# Kunlar tanlash tugallandi
+@dp.callback_query_handler(lambda c: c.data == 'days_done', state=NewMessage.specific_days)
 async def process_days_done(callback_query: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     selected_days = data.get('selected_days', [])
     
     if not selected_days:
-        await callback_query.answer("Kamida bitta kunni tanlang!")
+        await callback_query.answer("Iltimos, kamida bitta kunni tanlang!")
         return
     
-    await callback_query.answer("Kunlar saqlandi!")
+    await callback_query.answer()
     
-    # Ma'lumotlarni olish
+    # Xabarni rejalashtirish
     target_type = data.get('target_type')
     target_id = data.get('target_id')
     message_text = data.get('message_text')
-    days_str = ','.join(selected_days)
+    specific_days = ','.join(selected_days)
     
-    # Bazaga saqlash
-    now = datetime.now()
     cursor.execute(
-        "INSERT INTO scheduled_messages (target_type, target_id, message_text, specific_days, created_by, is_active) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (target_type, target_id, message_text, days_str, callback_query.from_user.id, True)
+        "INSERT INTO scheduled_messages (target_type, target_id, message_text, specific_days, created_by) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (target_type, target_id, message_text, specific_days, callback_query.from_user.id)
     )
     conn.commit()
     
@@ -1003,160 +756,78 @@ async def process_days_done(callback_query: types.CallbackQuery, state: FSMConte
         "sunday": "Yakshanba"
     }
     
-    selected_names = [days_names[d] for d in selected_days]
-    
-    await callback_query.message.edit_text(
-        f"✅ Xabar rejalashtirildi!\n\n"
-        f"Har hafta {', '.join(selected_names)} kunlari soat 09:00 da yuboriladi."
-    )
+    days_text = ", ".join([days_names.get(d, d) for d in selected_days])
     
     is_admin = callback_query.from_user.id in ADMIN_IDS
-    await callback_query.message.answer("Asosiy menyu:", reply_markup=get_main_keyboard(is_admin))
+    
+    await callback_query.message.edit_text(
+        f"✅ Xabar rejalashtirildi!\n"
+        f"Yuborish kunlari: {days_text}\n"
+        f"Vaqt: 09:00"
+    )
+    
+    await callback_query.message.answer(
+        "Asosiy menyu:",
+        reply_markup=get_main_keyboard(is_admin)
+    )
     
     await state.finish()
 
-# Rejalarni bekor qilish
+# Rejalashtirilgan xabarlarni bekor qilish
 @dp.message_handler(lambda message: message.text == "🚫 Rejalarni bekor qilish")
 async def cancel_scheduled_messages(message: types.Message):
     user_id = message.from_user.id
     
-    # Foydalanuvchining rejalashtirilgan xabarlarini olish
     cursor.execute(
-        "SELECT * FROM scheduled_messages WHERE created_by = ? AND is_active = 1",
+        "SELECT id, target_type, target_id, message_text FROM scheduled_messages WHERE created_by = ? AND is_active = 1",
         (user_id,)
     )
     messages = cursor.fetchall()
     
     if not messages:
-        await message.answer("❌ Sizning rejalashtirilgan xabarlaringiz yo'q")
+        await message.answer("❌ Sizda rejalashtirilgan xabarlar yo'q.")
         return
     
     keyboard = InlineKeyboardMarkup(row_width=1)
-    
-    for msg in messages:
-        msg_id, target_type, target_id, message_text, interval_minutes, specific_time, specific_days, last_sent, is_active, created_by = msg
-        
-        schedule_info = ""
-        if interval_minutes:
-            schedule_info = f"Har {interval_minutes} daqiqada"
-        elif specific_time:
-            schedule_info = f"Har kuni {specific_time} da"
-        elif specific_days:
-            days_list = specific_days.split(',')
-            days_names = {
-                "monday": "Dushanba", 
-                "tuesday": "Seshanba", 
-                "wednesday": "Chorshanba",
-                "thursday": "Payshanba", 
-                "friday": "Juma", 
-                "saturday": "Shanba", 
-                "sunday": "Yakshanba"
-            }
-            days_readable = [days_names.get(day, day) for day in days_list]
-            schedule_info = f"{', '.join(days_readable)} kunlari"
-        
-        target_info = f"@{target_id}" if target_id.startswith('@') else target_id
-        
-        button_text = f"❌ #{msg_id}: {target_info} ({schedule_info})"
+    for msg_id, target_type, target_id, message_text in messages:
         keyboard.add(InlineKeyboardButton(
-            text=button_text,
+            text=f"❌ {target_type} ({target_id}): {message_text[:30]}...",
             callback_data=f"cancel_msg_{msg_id}"
         ))
     
+    await message.answer("Bekor qilmoqchi bo'lgan xabarni tanlang:", reply_markup=keyboard)
+
+# Rejalashtirilgan xabarni bekor qilish
+@dp.callback_query_handler(lambda c: c.data.startswith('cancel_msg_'))
+async def cancel_specific_message(callback_query: types.CallbackQuery):
+    msg_id = int(callback_query.data.split('_')[2])
+    
+    cursor.execute("UPDATE scheduled_messages SET is_active = 0 WHERE id = ?", (msg_id,))
+    conn.commit()
+    
+    await callback_query.answer("Xabar bekor qilindi!")
+    await callback_query.message.edit_text(
+        callback_query.message.text + "\n\n✅ Xabar bekor qilindi!"
+    )
+
+# Text xabarlarni qayta ishlash
+@dp.message_handler()
+async def process_regular_messages(message: types.Message):
+    await register_user(message)
+    
+    # Agar xabar oddiy bo'lsa, start buyrug'ini yuborish
+    is_admin = message.from_user.id in ADMIN_IDS
+    keyboard = get_main_keyboard(is_admin)
+    
     await message.answer(
-        "🚫 Bekor qilmoqchi bo'lgan xabarni tanlang:",
+        "Iltimos, quyidagi menyudan foydalaning:",
         reply_markup=keyboard
     )
 
-@dp.callback_query_handler(lambda c: c.data.startswith('cancel_msg_'))
-async def process_cancel_message(callback_query: types.CallbackQuery):
-    msg_id = int(callback_query.data.split('_')[2])
-    
-    cursor.execute(
-        "UPDATE scheduled_messages SET is_active = 0 WHERE id = ? AND created_by = ?",
-        (msg_id, callback_query.from_user.id)
-    )
-    conn.commit()
-    
-    await callback_query.answer(f"#{msg_id} bekor qilindi!")
-    
-    # Qolgan xabarlarni tekshirish
-    cursor.execute(
-        "SELECT COUNT(*) FROM scheduled_messages WHERE created_by = ? AND is_active = 1",
-        (callback_query.from_user.id,)
-    )
-    count = cursor.fetchone()[0]
-    
-    if count > 0:
-        # Buttonlarni yangilash
-        cursor.execute(
-            "SELECT * FROM scheduled_messages WHERE created_by = ? AND is_active = 1",
-            (callback_query.from_user.id,)
-        )
-        messages = cursor.fetchall()
-        
-        keyboard = InlineKeyboardMarkup(row_width=1)
-        
-        for msg in messages:
-            msg_id, target_type, target_id, message_text, interval_minutes, specific_time, specific_days, last_sent, is_active, created_by = msg
-            
-            schedule_info = ""
-            if interval_minutes:
-                schedule_info = f"Har {interval_minutes} daqiqada"
-            elif specific_time:
-                schedule_info = f"Har kuni {specific_time} da"
-            elif specific_days:
-                days_list = specific_days.split(',')
-                days_names = {
-                    "monday": "Dushanba", 
-                    "tuesday": "Seshanba", 
-                    "wednesday": "Chorshanba",
-                    "thursday": "Payshanba", 
-                    "friday": "Juma", 
-                    "saturday": "Shanba", 
-                    "sunday": "Yakshanba"
-                }
-                days_readable = [days_names.get(day, day) for day in days_list]
-                schedule_info = f"{', '.join(days_readable)} kunlari"
-            
-            target_info = f"@{target_id}" if target_id.startswith('@') else target_id
-            
-            button_text = f"❌ #{msg_id}: {target_info} ({schedule_info})"
-            keyboard.add(InlineKeyboardButton(
-                text=button_text,
-                callback_data=f"cancel_msg_{msg_id}"
-            ))
-        
-        await callback_query.message.edit_text(
-            "🚫 Bekor qilmoqchi bo'lgan xabarni tanlang:",
-            reply_markup=keyboard
-        )
-    else:
-        is_admin = callback_query.from_user.id in ADMIN_IDS
-        await callback_query.message.edit_text("✅ Barcha rejalashtirilgan xabarlar bekor qilindi.")
-        await callback_query.message.answer("Asosiy menyu:", reply_markup=get_main_keyboard(is_admin))
-
-# Foydalanuvchi faolligini kuzatish
-@dp.message_handler()
-async def track_user_activity(message: types.Message):
-    await register_user(message)
-    
-    # Asosiy menyuga qaytish
-    if message.text == "/menu":
-        is_admin = message.from_user.id in ADMIN_IDS
-        await message.answer("Asosiy menyu:", reply_markup=get_main_keyboard(is_admin))
-    else:
-        # Boshqa buyruqlar uchun
-        await message.answer(
-            "🤔 Nima qilishni xohlaysiz?\n\n"
-            "Asosiy menyuga qaytish uchun /menu buyrug'ini yuboring.",
-            reply_markup=get_main_keyboard(message.from_user.id in ADMIN_IDS)
-        )
-
 if __name__ == '__main__':
-    # Scheduled taskni ishga tushirish
+    # Cron task larni ishga tushirish
     loop = asyncio.get_event_loop()
-    scheduled_check.start()
+    aiocron.crontab('* * * * *', func=scheduled_check, start=True, loop=loop)
     
     # Botni ishga tushirish
     executor.start_polling(dp, skip_updates=True)
